@@ -1,92 +1,176 @@
 (function () {
     'use strict';
 
+    // ========== Манифест ==========
     Lampa.Manifest.plugins = {
         type: 'other',
-        version: '1.0.1',
+        version: '1.0.3',
         name: 'NoAds',
         description: 'Блокировка рекламы',
-        component: 'noads'
+        component: 'noads_plugin'
     };
 
-    function block() {
-        console.log('[NoAds] Активирован');
+    // ========== Паттерны рекламных URL ==========
+    var AD_URL = /\/ad[s]?[\/?]|vast[\/?&.]|\.vast|ad_request|advert|prebid|pagead|doubleclick|googlesyndication/i;
 
-        // 1. Подмена проверки премиума
-        if (Lampa.Account) {
-            var origHas = Lampa.Account.hasPremium;
-            Lampa.Account.hasPremium = function () { return true; };
-        }
+    function isAdUrl(url) {
+        return typeof url === 'string' && AD_URL.test(url);
+    }
 
-        // 2. Нейтрализация модуля рекламы
-        if (Lampa.Ad) {
-            Lampa.Ad.show    = function () { console.log('[NoAds] Ad.show blocked'); return false; };
-            Lampa.Ad.load    = function () { console.log('[NoAds] Ad.load blocked'); return false; };
-            Lampa.Ad.request = function () { console.log('[NoAds] Ad.request blocked'); return false; };
-            Lampa.Ad.close   = function () { return true; };
-        }
+    // ========== Основная функция ==========
+    function start() {
+        console.log('[NoAds] запущен');
 
-        // 3. Блокировка VAST запросов через fetch
-        var origFetch = window.fetch;
-        window.fetch = function (input) {
-            var url = typeof input === 'string' ? input : (input.url || '');
-            if (/vast|\/ad\/|\/ads\/|ad_request|cub\.watch\/api\/ad/i.test(url)) {
-                console.log('[NoAds] fetch заблокирован:', url);
-                return Promise.resolve(new Response('{}', { status: 200 }));
+        // ---- 1. Подмена подписки в Storage ----
+        try {
+            var acc = Lampa.Storage.get('account', '{}');
+            if (typeof acc === 'string') acc = JSON.parse(acc);
+            acc.premium = true;
+            Lampa.Storage.set('account', acc);
+        } catch (e) {}
+
+        // Перехват Storage.get — при любом чтении account
+        // всегда premium = true
+        var origGet = Lampa.Storage.get.bind(Lampa.Storage);
+        Lampa.Storage.get = function (key, def) {
+            var val = origGet(key, def);
+            if (key === 'account' || key === 'account_premium') {
+                if (typeof val === 'object' && val !== null) {
+                    val.premium = true;
+                }
+                if (key === 'account_premium') return true;
             }
-            return origFetch.apply(this, arguments);
+            return val;
         };
 
-        // 4. Блокировка VAST через XHR
-        var origOpen = XMLHttpRequest.prototype.open;
-        XMLHttpRequest.prototype.open = function (method, url) {
-            if (/vast|\/ad\/|\/ads\/|ad_request|cub\.watch\/api\/ad/i.test(url)) {
-                console.log('[NoAds] XHR заблокирован:', url);
-                arguments[1] = 'data:text/plain,';
-            }
-            return origOpen.apply(this, arguments);
-        };
+        // ---- 2. Подмена рекламных объектов (безопасно) ----
+        var noop = function () { return false; };
+        var adNames = ['Ad', 'Ads', 'Advert', 'ADManager'];
 
-        // 5. Удаление рекламных шаблонов
-        ['ad_overlay', 'ad_banner', 'ad_panel'].forEach(function (name) {
-            try { Lampa.Template.add(name, '<div></div>'); } catch (e) {}
+        adNames.forEach(function (name) {
+            if (Lampa[name] && typeof Lampa[name] === 'object') {
+                Object.keys(Lampa[name]).forEach(function (fn) {
+                    if (typeof Lampa[name][fn] === 'function') {
+                        Lampa[name][fn] = noop;
+                    }
+                });
+            }
         });
 
-        // 6. Перехват Listener — блокируем показ interstitial
-        var origFollow = Lampa.Listener.follow;
-        Lampa.Listener.follow = function (name, callback) {
-            if (typeof callback === 'function') {
-                var wrapped = function (e) {
-                    // Не даём рекламным обработчикам сработать
-                    if (e && e.ad) return;
-                    return callback.apply(this, arguments);
-                };
-                return origFollow.call(this, name, wrapped);
+        // ---- 3. Перехват fetch ----
+        var _fetch = window.fetch;
+        window.fetch = function (input, init) {
+            var url = typeof input === 'string'
+                ? input
+                : (input && input.url ? input.url : '');
+            if (isAdUrl(url)) {
+                console.log('[NoAds] fetch blocked:', url);
+                return Promise.resolve(
+                    new Response('{}', {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' }
+                    })
+                );
             }
-            return origFollow.apply(this, arguments);
+            return _fetch.apply(this, arguments);
         };
 
-        // 7. CSS — скрытие рекламных элементов
+        // ---- 4. Перехват XMLHttpRequest ----
+        var _xhrOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function (method, url) {
+            if (isAdUrl(url)) {
+                console.log('[NoAds] XHR blocked:', url);
+                this._blocked = true;
+                return _xhrOpen.call(this, method, 'data:text/plain,');
+            }
+            this._blocked = false;
+            return _xhrOpen.apply(this, arguments);
+        };
+
+        var _xhrSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.send = function () {
+            if (this._blocked) {
+                console.log('[NoAds] XHR send blocked');
+                return;
+            }
+            return _xhrSend.apply(this, arguments);
+        };
+
+        // ---- 5. CSS — скрытие рекламных элементов ----
+        // Только конкретные классы, чтобы не задеть меню
         var style = document.createElement('style');
         style.textContent = [
-            '.ad-overlay, .ad-panel, .card--ad,',
-            '[class*="ad-video"], [class*="ad_overlay"],',
-            '[class*="vast-"], .ad-overlay__content {',
-            '  display:none!important;',
-            '  opacity:0!important;',
-            '  pointer-events:none!important;',
+            '.ad-overlay,',
+            '.ad-panel,',
+            '.ad-video-wrapper,',
+            '.card--ad,',
+            '.ad-overlay__content,',
+            '.ad-preroll,',
+            '.vast-overlay,',
+            '.vast-container {',
+            '  display: none !important;',
+            '  width: 0 !important;',
+            '  height: 0 !important;',
+            '  opacity: 0 !important;',
+            '  pointer-events: none !important;',
+            '  position: absolute !important;',
+            '  left: -9999px !important;',
             '}'
-        ].join('');
+        ].join('\n');
         document.head.appendChild(style);
+
+        // ---- 6. MutationObserver — точечное удаление ----
+        // Только элементы с конкретными рекламными классами
+        var adClasses = [
+            'ad-overlay', 'ad-panel', 'ad-video-wrapper',
+            'card--ad', 'ad-preroll', 'vast-overlay',
+            'vast-container', 'ad-overlay__content'
+        ];
+
+        function isAdElement(node) {
+            if (!node.classList) return false;
+            for (var i = 0; i < adClasses.length; i++) {
+                if (node.classList.contains(adClasses[i])) return true;
+            }
+            return false;
+        }
+
+        var observer = new MutationObserver(function (mutations) {
+            mutations.forEach(function (mut) {
+                mut.addedNodes.forEach(function (node) {
+                    if (node.nodeType === 1 && isAdElement(node)) {
+                        node.remove();
+                        console.log('[NoAds] DOM element removed');
+                    }
+                });
+            });
+        });
+
+        if (document.body) {
+            observer.observe(document.body, {
+                childList: true,
+                subtree: true
+            });
+        }
+
+        // ---- 7. Перехват создания video только для VAST ----
+        // НЕ блокируем обычное видео, только рекламное
+        var origAppend = Element.prototype.appendChild;
+        Element.prototype.appendChild = function (child) {
+            if (child && child.tagName === 'VIDEO' && child.src && isAdUrl(child.src)) {
+                console.log('[NoAds] ad video blocked');
+                return child; // не вставляем, возвращаем как есть
+            }
+            return origAppend.apply(this, arguments);
+        };
     }
 
-    // Инициализация
+    // ========== Запуск ==========
     if (window.appready) {
-        block();
+        start();
     } else {
         Lampa.Listener.follow('app', function (e) {
-            if (e.type === 'ready') block();
+            if (e.type === 'ready') start();
         });
     }
-
 })();
