@@ -1,43 +1,56 @@
 (function () {
     'use strict';
 
-    var PLUGIN_FLAG = 'plugin_ad_skipper_webos_v13';
+    var PLUGIN_FLAG = 'plugin_ad_skipper_webos_v16';
     if (window[PLUGIN_FLAG]) return;
     window[PLUGIN_FLAG] = true;
 
-    console.log('[AdSkipper] Initializing v13 (root-cause fix)...');
+    console.log('[AdSkipper] Initializing v16 (regex mirrors + safe spoof)...');
 
     // ==========================================
-    // 1. СЕТЕВАЯ БЛОКИРОВКА
+    // ХЕЛПЕРЫ
     // ==========================================
+    function createSafeProgressEvent(type) {
+        try {
+            return new ProgressEvent(type);
+        } catch (e) {
+            return new Event(type);
+        }
+    }
 
-    // Запасной список доменов, которые реально отдают рекламный контент/трекинг.
-    // Оставлен как defense-in-depth, но это НЕ главный источник проблемы.
-    var AD_HOSTS = ['ad.cub.red', 'ads.cub.red', 'ad.cub.rip', 'ads.cub.rip'];
+    // Регулярка для любых зеркал: ad.cub.red, ads.cub.black, ad.cub.best и т.д.
+    var AD_HOST_REGEX = /^(ad|ads)\.cub\.[a-z]+$/i;
 
     function isAdHostUrl(url) {
         if (!url || typeof url !== 'string') return false;
         try {
             var hostname = new URL(url, window.location.href).hostname;
-            return AD_HOSTS.some(function (host) {
-                return hostname === host || hostname.endsWith('.' + host);
-            });
+            // Проверка по регулярному выражению
+            return AD_HOST_REGEX.test(hostname);
         } catch (e) {
             return false;
         }
     }
 
-
     function isAdConfigUrl(url) {
         if (!url || typeof url !== 'string') return false;
-        return /\/api\/ad\/get\//.test(url);
+        try {
+            var parsed = new URL(url, window.location.href);
+            // Домен не важен (может быть любое зеркало), проверяем только путь
+            return parsed.pathname === '/api/ad/get/' || parsed.pathname.startsWith('/api/ad/get/');
+        } catch (e) {
+            return false;
+        }
     }
 
-    function fakeEmptyAdJson() {
-        return JSON.stringify({ ad: [] });
+    function getFakeAdJson() {
+        return JSON.stringify({ ad: [], settings: {}, ab: {} });
     }
 
-    // --- Fetch ---
+    // ==========================================
+    // 1. СЕТЕВАЯ БЛОКИРОВКА (Fetch + XHR)
+    // ==========================================
+    
     if (window.fetch) {
         var originalFetch = window.fetch;
         window.fetch = function (input, init) {
@@ -45,7 +58,7 @@
 
             if (isAdConfigUrl(url)) {
                 console.log('[AdSkipper] Faked empty ad-config (200):', url);
-                return Promise.resolve(new Response(fakeEmptyAdJson(), {
+                return Promise.resolve(new Response(getFakeAdJson(), {
                     status: 200,
                     statusText: 'OK',
                     headers: { 'Content-Type': 'application/json' }
@@ -61,7 +74,6 @@
         };
     }
 
-    // --- XMLHttpRequest ---
     if (window.XMLHttpRequest) {
         var xhrStateMap = new WeakMap();
 
@@ -112,7 +124,7 @@
                                 var rt = self.responseType;
                                 var status = mode === 'fake_json' ? 200 : 204;
                                 var statusText = mode === 'fake_json' ? 'OK' : 'No Content';
-                                var bodyText = mode === 'fake_json' ? fakeEmptyAdJson() : '';
+                                var bodyText = mode === 'fake_json' ? getFakeAdJson() : '';
 
                                 Object.defineProperty(self, 'readyState', { value: 4, configurable: true });
                                 Object.defineProperty(self, 'status', { value: status, configurable: true });
@@ -120,11 +132,12 @@
                                 Object.defineProperty(self, 'responseURL', { value: state.url, configurable: true });
 
                                 if (rt === 'json') {
-                                    Object.defineProperty(self, 'response', { value: mode === 'fake_json' ? { ad: [] } : {}, configurable: true });
+                                    Object.defineProperty(self, 'response', { value: mode === 'fake_json' ? JSON.parse(bodyText) : {}, configurable: true });
                                 } else if (rt === 'blob') {
                                     Object.defineProperty(self, 'response', { value: new Blob([bodyText]), configurable: true });
                                 } else if (rt === 'arraybuffer') {
-                                    Object.defineProperty(self, 'response', { value: new ArrayBuffer(0), configurable: true });
+                                    var buffer = mode === 'fake_json' ? new TextEncoder().encode(bodyText).buffer : new ArrayBuffer(0);
+                                    Object.defineProperty(self, 'response', { value: buffer, configurable: true });
                                 } else if (rt === 'document') {
                                     Object.defineProperty(self, 'response', { value: null, configurable: true });
                                 } else {
@@ -142,8 +155,8 @@
                                 };
 
                                 self.dispatchEvent(new Event('readystatechange'));
-                                self.dispatchEvent(new ProgressEvent('load'));
-                                self.dispatchEvent(new ProgressEvent('loadend'));
+                                self.dispatchEvent(createSafeProgressEvent('load'));
+                                self.dispatchEvent(createSafeProgressEvent('loadend'));
                             } catch (e) {
                                 console.warn('[AdSkipper] Failed to spoof XHR properties', e);
                             }
@@ -156,7 +169,6 @@
                 xhr.abort = function () {
                     var state = xhrStateMap.get(xhr);
                     if (state && state.blocked) {
-                        console.log('[AdSkipper] Abort called on blocked XHR (preventing callbacks)');
                         state.blocked = false;
                         return;
                     }
@@ -169,20 +181,44 @@
     }
 
     // ==========================================
-    // 2. ДОП. ПОПЫТКА ПАТЧА ПУБЛИЧНОГО API
+    // 2. БЕЗОПАСНЫЙ СПУФ ACCOUNT
+    // ==========================================
+    function patchAccount() {
+        function applySpoof(obj) {
+            if (!obj) return;
+            try {
+                obj.hasPremium = function () { return true; };
+                console.log('[AdSkipper] Spoofed Account.hasPremium = true');
+            } catch (e) {}
+        }
+
+        if (window.Account) applySpoof(window.Account);
+        if (window.Lampa && window.Lampa.Account) applySpoof(window.Lampa.Account);
+
+        try {
+            var _account = window.Account;
+            Object.defineProperty(window, 'Account', {
+                get: function () { return _account; },
+                set: function (val) {
+                    _account = val;
+                    applySpoof(_account);
+                },
+                configurable: true
+            });
+        } catch (e) {}
+    }
+
+    // ==========================================
+    // 3. ПАТЧ PREROLL API
+    // ==========================================
     function patchPrerollMethodsIfExposed() {
         try {
             var candidates = [
                 window.Lampa && window.Lampa.Advert && window.Lampa.Advert.Preroll,
-                window.Lampa && window.Lampa.Preroll,
-                window.Lampa && window.Lampa.Advert && window.Lampa.Advert.IMA,
-                window.Lampa && window.Lampa.IMA
+                window.Lampa && window.Lampa.Preroll
             ].filter(Boolean);
 
-            if (!candidates.length) {
-                console.log('[AdSkipper] Public Preroll/IMA API not exposed - relying on network-level fix only (this is normal).');
-                return;
-            }
+            if (!candidates.length) return;
 
             candidates.forEach(function (mod) {
                 if (typeof mod.canShow === 'function') {
@@ -191,22 +227,13 @@
                 if (typeof mod.getMediaType === 'function') {
                     mod.getMediaType = function () { return { any: true }; };
                 }
-                if (typeof mod.show === 'function') {
-                    mod.show = function (data, call) {
-                        console.log('[AdSkipper] Preroll.show intercepted, skipping ad instantly');
-                        if (typeof call === 'function') call();
-                    };
-                }
             });
-
-            console.log('[AdSkipper] Public Preroll/IMA methods patched (bonus layer).');
-        } catch (e) {
-            console.warn('[AdSkipper] optional Preroll patch failed', e);
-        }
+            console.log('[AdSkipper] Public Preroll methods patched.');
+        } catch (e) {}
     }
 
     // ==========================================
-    // 3. МЯГКИЙ DOM-СТРАЖ (страховка, в норме теперь не должен срабатывать)
+    // 4. МЯГКИЙ DOM-СТРАЖ
     // ==========================================
     function setupDomGuard() {
         if (!document.body) {
@@ -227,11 +254,13 @@
 
                             node.style.setProperty('display', 'none', 'important');
 
-                            // Если реклама всё же пытается показаться - принудительно
-                            // возвращаем управление пульту, чтобы навигация не зависала.
                             try {
                                 if (window.Lampa && window.Lampa.Controller) {
-                                    window.Lampa.Controller.toggle(window.Lampa.Controller.enabled().name === 'ad_preroll' || window.Lampa.Controller.enabled().name === 'ad_video_block' ? 'content' : window.Lampa.Controller.enabled().name);
+                                    var currentCtrl = window.Lampa.Controller.enabled();
+                                    if (currentCtrl && typeof currentCtrl === 'object' && 
+                                       (currentCtrl.name === 'ad_preroll' || currentCtrl.name === 'ad_video_block')) {
+                                        window.Lampa.Controller.toggle('content');
+                                    }
                                 }
                             } catch (e) {}
 
@@ -239,7 +268,6 @@
                                 if (node.parentNode) {
                                     if (!node.querySelector('.player') && !node.querySelector('#player')) {
                                         node.parentNode.removeChild(node);
-                                        console.log('[AdSkipper] Safely removed hidden ad element.');
                                     }
                                 }
                             }, 1000);
@@ -252,17 +280,14 @@
     }
 
     // ==========================================
-    // 4. ИНИЦИАЛИЗАЦИЯ
+    // 5. ИНИЦИАЛИЗАЦИЯ
     // ==========================================
     function initializeProtection() {
+        patchAccount();
         patchPrerollMethodsIfExposed();
         setupDomGuard();
     }
 
-    // Сетевые перехватчики (fetch/XHR) уже активны сразу после выполнения IIFE,
-    // поэтому первый же запрос /api/ad/get/preroll (который Lampa делает при
-    // старте плеера) будет перехвачен независимо от того, когда сработает
-    // initializeProtection().
     if (window.appready) {
         setTimeout(initializeProtection, 500);
     } else if (window.Lampa && window.Lampa.Listener) {
