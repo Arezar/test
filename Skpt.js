@@ -1,13 +1,15 @@
 (function () {
     'use strict';
 
-    var PLUGIN_FLAG = 'plugin_ad_skipper_webos_v5';
+    var PLUGIN_FLAG = 'plugin_ad_skipper_webos_v7';
     if (window[PLUGIN_FLAG]) return;
     window[PLUGIN_FLAG] = true;
 
-    console.log('[AdSkipper] Initializing v5 (VastManager.filter override)...');
+    console.log('[AdSkipper] Initializing v7 (Safe multi-layer interception)...');
 
-    // --- 1. Сетевая страховка (204 No Content) ---
+    // ==========================================
+    // 1. СЕТЕВАЯ БЛОКИРОВКА (204 No Content)
+    // ==========================================
     var AD_HOSTS = ['ad.cub.red', 'ads.cub.red', 'ad.cub.rip', 'ads.cub.rip'];
     
     function isAdUrl(url) {
@@ -48,7 +50,9 @@
                         Object.defineProperty(self, 'responseText', { value: '', writable: true });
                         if (self.onreadystatechange) self.onreadystatechange();
                         if (self.onload) self.onload();
-                    } catch (e) {}
+                    } catch (e) {
+                        console.warn('[AdSkipper] Failed to spoof XHR response', e);
+                    }
                 }, 0);
                 return;
             }
@@ -56,44 +60,128 @@
         };
     }
 
-    // --- 2. Ключевой перехват: VastManager.filter ---
-    // Он заставляет менеджер всегда возвращать null, то есть "рекламы нет".
-    function patchVastManager() {
+    // ==========================================
+    // 2. ПЕРЕХВАТ ЛОГИКИ IMA
+    // ==========================================
+    
+    // Приоритетный метод: IMA.getMediaType
+    // Согласно исходному коду preroll.js, возврат объекта { any: true } 
+    // заставляет систему пропустить рекламу.
+    function patchIMAMediaType() {
         try {
-            // Ищем класс VastManager. В разных сборках он может лежать в Lampa.Advert или быть глобальным.
-            var VastManagerClass = null;
-            if (window.Lampa && window.Lampa.Advert && window.Lampa.Advert.VastManager) {
-                VastManagerClass = window.Lampa.Advert.VastManager;
-            } else if (window.Lampa && window.Lampa.VastManager) {
-                VastManagerClass = window.Lampa.VastManager;
-            }
+            var IMA = (window.Lampa && window.Lampa.IMA) 
+                   || (window.Lampa && window.Lampa.Advert && window.Lampa.Advert.IMA);
 
-            if (!VastManagerClass || !VastManagerClass.prototype) {
+            if (!IMA) {
+                console.warn('[AdSkipper] IMA module not found. Trying next fallback...');
                 return false;
             }
 
-            // Подменяем filter на прототипе
-            var originalFilter = VastManagerClass.prototype.filter;
-            VastManagerClass.prototype.filter = function (view) {
-                console.log('[AdSkipper] VastManager.filter intercepted. Blocking ads.');
-                return null; // Всегда говорим: "нет рекламы"
+            if (typeof IMA.getMediaType !== 'function') {
+                console.warn('[AdSkipper] IMA.getMediaType is not a function. Trying next fallback...');
+                return false;
+            }
+
+            // Сохраняем оригинал для возможного восстановления
+            var originalGetMediaType = IMA.getMediaType;
+            
+            IMA.getMediaType = function (data) {
+                try {
+                    console.log('[AdSkipper] IMA.getMediaType intercepted. Blocking ads.');
+                    return { any: true }; // Ключевой флаг для пропуска рекламы
+                } catch (e) {
+                    console.error('[AdSkipper] Error in patched getMediaType:', e);
+                    return originalGetMediaType.apply(this, arguments);
+                }
             };
 
-            console.log('[AdSkipper] VastManager.filter patched successfully.');
+            console.log('[AdSkipper] IMA.getMediaType patched successfully.');
             return true;
         } catch (e) {
-            console.error('[AdSkipper] Failed to patch VastManager:', e);
+            console.error('[AdSkipper] Failed to patch IMA.getMediaType:', e);
             return false;
         }
     }
 
-    // --- 3. DOM-страховка (удаление любых прорвавшихся элементов) ---
+    // Резервный метод: IMA.canShow
+    // Более безопасная альтернатива перехвату Preroll.show
+    function patchIMACanShow() {
+        try {
+            var IMA = (window.Lampa && window.Lampa.IMA) 
+                   || (window.Lampa && window.Lampa.Advert && window.Lampa.Advert.IMA);
+
+            if (!IMA || typeof IMA.canShow !== 'function') {
+                return false;
+            }
+
+            var originalCanShow = IMA.canShow;
+            IMA.canShow = function (data) {
+                try {
+                    console.log('[AdSkipper] IMA.canShow intercepted. Returning false.');
+                    return false;
+                } catch (e) {
+                    console.error('[AdSkipper] Error in patched canShow:', e);
+                    return originalCanShow.apply(this, arguments);
+                }
+            };
+
+            console.log('[AdSkipper] IMA.canShow patched successfully.');
+            return true;
+        } catch (e) {
+            console.error('[AdSkipper] Failed to patch IMA.canShow:', e);
+            return false;
+        }
+    }
+
+    // ==========================================
+    // 3. БЕЗОПАСНЫЙ РЕЗЕРВНЫЙ ПЕРЕХВАТ PREROLL.SHOW
+    // ==========================================
+    // Используется только если IMA модули недоступны.
+    // Вместо агрессивного вмешательства, мы аккуратно вызываем колбэк.
+    function patchPrerollShowFallback() {
+        try {
+            var Preroll = (window.Lampa && window.Lampa.Advert && window.Lampa.Advert.Preroll)
+                || (window.Lampa && window.Lampa.Preroll);
+
+            if (!Preroll || typeof Preroll.show !== 'function') {
+                console.warn('[AdSkipper] Preroll.show not found. Ad blocking may be incomplete.');
+                return false;
+            }
+
+            var originalShow = Preroll.show;
+            Preroll.show = function (data, call) {
+                console.log('[AdSkipper] Preroll.show intercepted (fallback). Skipping ad.');
+                // Асинхронный вызов колбэка, чтобы не ломать текущий стек вызовов плеера
+                if (typeof call === 'function') {
+                    setTimeout(function () {
+                        try {
+                            call();
+                        } catch (e) {
+                            console.error('[AdSkipper] Error in Preroll.show callback:', e);
+                        }
+                    }, 0);
+                }
+                return false;
+            };
+
+            console.log('[AdSkipper] Preroll.show patched (fallback).');
+            return true;
+        } catch (e) {
+            console.error('[AdSkipper] Failed to patch Preroll.show:', e);
+            return false;
+        }
+    }
+
+    // ==========================================
+    // 4. DOM-СТРАХОВКА
+    // ==========================================
     function killAdVideo(node) {
         if (!node) return;
         var videos = node.tagName === 'VIDEO' ? [node] : node.querySelectorAll('video');
         videos.forEach(function (video) {
+            // Защита основного плеера
             if (video.closest('.player') || video.closest('.video-player') || video.id === 'player') {
-                return; // Не трогаем основной плеер
+                return;
             }
             try {
                 video.pause();
@@ -133,29 +221,39 @@
         observer.observe(document.body, { childList: true, subtree: true });
     }
 
-    // --- Инициализация ---
-    // Пытаемся пропатчить сразу, если VastManager уже есть
-    if (patchVastManager()) {
-        setupDomGuard();
-    } else {
-        // Если нет, ждём события готовности приложения
-        if (window.Lampa && window.Lampa.Listener) {
-            window.Lampa.Listener.follow('app', function (e) {
-                if (e.type === 'ready') {
-                    setTimeout(function () {
-                        if (!patchVastManager()) {
-                            console.warn('[AdSkipper] VastManager not found after app ready.');
-                        }
-                        setupDomGuard();
-                    }, 1000);
-                }
-            });
-        } else {
-            // Крайний случай: пробуем через 3 секунды
-            setTimeout(function () {
-                patchVastManager();
-                setupDomGuard();
-            }, 3000);
+    // ==========================================
+    // ИНИЦИАЛИЗАЦИЯ
+    // ==========================================
+    function initializeProtection() {
+        // Пытаемся применить перехваты в порядке приоритета
+        var patched = false;
+
+        if (patchIMAMediaType()) {
+            patched = true;
+        } else if (patchIMACanShow()) {
+            patched = true;
+        } else if (patchPrerollShowFallback()) {
+            patched = true;
         }
+
+        if (!patched) {
+            console.warn('[AdSkipper] No IMA or Preroll modules found. Only network blocking is active.');
+        }
+
+        // DOM-страховка работает всегда
+        setupDomGuard();
+    }
+
+    // Ждем загрузки приложения Lampa для гарантии наличия модулей
+    if (window.Lampa && window.Lampa.Listener) {
+        window.Lampa.Listener.follow('app', function (e) {
+            if (e.type === 'ready') {
+                // Небольшая задержка для инициализации всех внутренних модулей
+                setTimeout(initializeProtection, 1000);
+            }
+        });
+    } else {
+        // Крайний случай: пробуем через 3 секунды
+        setTimeout(initializeProtection, 3000);
     }
 })();
