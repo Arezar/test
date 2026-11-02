@@ -1,0 +1,11 @@
+{
+  "name": "skpt-lampa-adblock",
+  "version": "2.1.0",
+  "private": true,
+  "description": "Ad-blocking plugin for the Lampa TV client (webOS/Tizen/Android TV)",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "check": "node --check Skpt.js"
+  },
+  "license": "MIT"
+}
