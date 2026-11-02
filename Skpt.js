@@ -40,6 +40,7 @@
     var savedController = '';
     var settingsInstalled = false;
     var adStyle = null;
+    var handledNodes = [];   // оверлеи, которым выставили inline display:none
 
     // ------------------------------------------------------------------
     // Хранилище, логи, главный выключатель
@@ -134,6 +135,7 @@
     var userRules = [];    // skpt_rules + SkptAdBlock.addRule()
     var hostRules = [];    // skpt_hosts (домены через запятую, для ввода с пульта)
     var allowHosts = [];
+    var MAX_RULES = 200;   // защита от бесконтрольного роста списка правил
 
     function loadJsonArray(key) {
         try {
@@ -147,6 +149,10 @@
     }
 
     function addRule(pattern, action) {
+        if (userRules.length >= MAX_RULES) {
+            warn('достигнут лимит пользовательских правил:', MAX_RULES);
+            return false;
+        }
         var re;
         try {
             // Проверка по наличию .test() работает и для RegExp из другого realm'а.
@@ -163,6 +169,7 @@
     function parseHosts(text) {
         var parts = String(text || '').split(/[\s,;]+/), out = [], i, h;
         for (i = 0; i < parts.length; i++) {
+            if (out.length >= MAX_RULES) break;
             h = parts[i].replace(/^https?:\/\//i, '').split('/')[0].replace(/^\*\./, '').toLowerCase();
             if (!h) continue;
             // Хост может быть началом URL, поддоменом или стоять после порта.
@@ -380,7 +387,10 @@
         var nativeAbort = P.abort;
 
         function finishFake(xhr, st, gen) {
-            if (!installed || !st || st.done || st.cancelled || st.gen !== gen || !st.mode) return;
+            // Не проверяем uninstall: если хуки сняли между send() и таймером,
+            // подделку всё равно надо довести до конца, иначе XHR зависнет
+            // в readyState: 1 без load/loadend.
+            if (!st || st.done || st.cancelled || st.gen !== gen || !st.mode) return;
             st.done = true;
 
             var isFake = st.mode.action === 'fake';
@@ -523,8 +533,11 @@
             stats.scripts += blocked.length;
             log('script: заблокировано', blocked.length, blocked.join(', '));
 
-            for (i = 0; i < blocked.length; i++) {
-                if (typeof error === 'function') { try { error(blocked[i]); } catch (e) {} }
+            // Один вызов error() вместо одного на каждый URL: пользовательские
+            // error-обработчики не засыпаются сообщениями, но Promise
+            // IMA.loadSDK* всё равно получает reject (у него complete === false).
+            if (typeof error === 'function') {
+                try { error(blocked[0]); } catch (e) {}
             }
             if (!kept.length) {
                 // putScriptAsync([]) никогда не вызовет complete — вызываем сами,
@@ -644,6 +657,17 @@
     function installLampaHooks(L) {
         try { installSettings(L); } catch (e) { warn('экран настроек:', e && e.message); }
 
+        // Фолбэк для случая, когда рекламный оверлей появился раньше Player 'create':
+        // запоминаем обычный контроллер, чтобы было куда вернуться.
+        if (!savedController) {
+            try {
+                if (L.Controller && typeof L.Controller.enabled === 'function') {
+                    var c = L.Controller.enabled();
+                    if (c && c.name && c.name.indexOf('ad_') !== 0) savedController = c.name;
+                }
+            } catch (e) {}
+        }
+
         var Player = L.Player;
         if (!Player) return;
 
@@ -700,6 +724,21 @@
         return false;
     }
 
+    function restoreHandledNodes() {
+        for (var i = 0; i < handledNodes.length; i++) {
+            var node = handledNodes[i];
+            try {
+                node.__skpt_handled = false;
+                // Снимаем именно inline-стиль; внешний CSS мы удаляем отдельно.
+                if (node.style) {
+                    if (typeof node.style.removeProperty === 'function') node.style.removeProperty('display');
+                    else node.style.display = '';
+                }
+            } catch (e) {}
+        }
+        handledNodes = [];
+    }
+
     function syncDomStyle() {
         if (isActive()) {
             if (adStyle || !document.body) return;
@@ -711,15 +750,21 @@
                 ));
                 (document.head || document.body).appendChild(adStyle);
             } catch (e) { adStyle = null; }
-        } else if (adStyle) {
-            try { if (adStyle.parentNode) adStyle.parentNode.removeChild(adStyle); } catch (e) {}
-            adStyle = null;
+        } else {
+            // При выключении/снятии плагина возвращаем узлы в исходный вид,
+            // иначе скрытый оверлей останется с display:none навсегда.
+            restoreHandledNodes();
+            if (adStyle) {
+                try { if (adStyle.parentNode) adStyle.parentNode.removeChild(adStyle); } catch (e) {}
+                adStyle = null;
+            }
         }
     }
 
     function handleAdNode(node) {
         if (!isActive() || !node || node.nodeType !== 1 || node.__skpt_handled) return;
         node.__skpt_handled = true;
+        handledNodes.push(node);
         stats.dom++;
 
         try { node.style.setProperty('display', 'none', 'important'); }
